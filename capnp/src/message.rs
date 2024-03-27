@@ -70,10 +70,10 @@
 //! ```
 
 use crate::any_pointer;
+use crate::private::arena::ReaderArenaImpl;
 use crate::private::arena::{BuilderArena, BuilderArenaImpl};
-use crate::private::arena::{ReaderArena, ReaderArenaImpl};
 use crate::private::layout;
-use crate::private::units::BYTES_PER_WORD;
+use crate::private::units::{BYTES_PER_WORD, WORDS_PER_POINTER};
 use crate::traits::{FromPointerBuilder, SetterInput};
 use crate::traits::{FromPointerReader, Owned};
 use crate::OutputSegments;
@@ -139,21 +139,70 @@ impl ReaderOptions {
     }
 }
 
+/// A single read-only segment in a set of [`ReaderSegments`]. Guaranteed to implement
+/// `AsRef<[u8]>`, but comes with a set of optimised reading methods for performance,
+/// for example via [`AlignedSegment`].
+pub trait ReaderSegment: AsRef<[u8]> {
+    fn len_words(&self) -> usize;
+}
+
+impl ReaderSegment for [u8] {
+    fn len_words(&self) -> usize {
+        self.len() / BYTES_PER_WORD
+    }
+}
+
+impl<'a, S: ReaderSegment + ?Sized> ReaderSegment for &'a S {
+    fn len_words(&self) -> usize {
+        S::len_words(self)
+    }
+}
+
+/// A byte slice which is guaranteed to be aligned to a word (8 byte) interval.
+#[derive(Clone, Copy)]
+pub struct AlignedReaderSegment<'a>(&'a [u8]);
+
+impl<'a> AlignedReaderSegment<'a> {
+    /// Tries to wrap a slice, returning `None` if the slice is not aligned to an 8 byte interval.
+    pub fn new(bytes: &'a [u8]) -> Option<Self> {
+        // Check alignment
+        let start_ptr = bytes.as_ptr() as usize;
+        if start_ptr % BYTES_PER_WORD != 0 {
+            return None;
+        }
+
+        Some(Self(bytes))
+    }
+}
+
+impl<'a> AsRef<[u8]> for AlignedReaderSegment<'a> {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<'a> ReaderSegment for AlignedReaderSegment<'a> {
+    fn len_words(&self) -> usize {
+        self.0.len() / BYTES_PER_WORD
+    }
+}
+
 /// An object that manages the buffers underlying a Cap'n Proto message reader.
 pub trait ReaderSegments {
-    /// Gets the segment with index `idx`. Returns `None` if `idx` is out of range.
+    type Segment<'a>: ReaderSegment
+    where
+        Self: 'a;
+
+    /// Immutably ets the segment with index `idx`. Returns `None` if `idx` is out of range.
     ///
-    /// The segment must be 8-byte aligned or the "unaligned" feature must
-    /// be enabled in the capnp crate. (Otherwise reading the segment will return an error.)
-    ///
-    /// The returned slice is required to point to memory that remains valid until the ReaderSegments
+    /// The returned segment is required to point to memory that remains valid until the ReaderSegments
     /// object is dropped. In safe Rust, it should not be possible to violate this requirement.
-    fn get_segment(&self, idx: u32) -> Option<&[u8]>;
+    fn read_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>>;
 
     /// Gets the number of segments.
     fn len(&self) -> usize {
         for i in 0.. {
-            if self.get_segment(i as u32).is_none() {
+            if self.read_segment(i as u32).is_none() {
                 return i;
             }
         }
@@ -163,14 +212,21 @@ pub trait ReaderSegments {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    // TODO(apibump): Consider putting extract_cap(), inject_cap(), drop_cap() here
+    //   and on message::Reader. Then we could get rid of Imbue and ImbueMut, and
+    //   layout::StructReader, layout::ListReader, etc. could drop their `cap_table` fields.
 }
 
-impl<S> ReaderSegments for &S
+impl<'b, S> ReaderSegments for &'b S
 where
-    S: ReaderSegments,
+    S: ReaderSegments + ?Sized,
 {
-    fn get_segment(&self, idx: u32) -> Option<&[u8]> {
-        (**self).get_segment(idx)
+    type Segment<'a> = S::Segment<'a>
+        where Self: 'a;
+
+    fn read_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
+        (**self).read_segment(idx)
     }
 
     fn len(&self) -> usize {
@@ -178,19 +234,25 @@ where
     }
 }
 
-/// An array of segments.
+/// An array of segments, aligned to an 8-byte interval.
+///
+/// If you don't know that your segments are aligned to an 8-byte interval,
+/// use a slice of slices (`&[&[u8]]`) instead. Note that this incurs a performance
+/// penalty.
 pub struct SegmentArray<'a> {
-    segments: &'a [&'a [u8]],
+    segments: &'a [AlignedReaderSegment<'a>],
 }
 
 impl<'a> SegmentArray<'a> {
-    pub fn new(segments: &'a [&'a [u8]]) -> SegmentArray<'a> {
+    pub fn new(segments: &'a [AlignedReaderSegment<'a>]) -> SegmentArray<'a> {
         SegmentArray { segments }
     }
 }
 
 impl<'b> ReaderSegments for SegmentArray<'b> {
-    fn get_segment(&self, id: u32) -> Option<&[u8]> {
+    type Segment<'a> = AlignedReaderSegment<'a> where Self: 'a;
+
+    fn read_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
         self.segments.get(id as usize).copied()
     }
 
@@ -200,7 +262,9 @@ impl<'b> ReaderSegments for SegmentArray<'b> {
 }
 
 impl<'b> ReaderSegments for [&'b [u8]] {
-    fn get_segment(&self, id: u32) -> Option<&[u8]> {
+    type Segment<'a> = &'a [u8] where Self: 'a;
+
+    fn read_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
         self.get(id as usize).copied()
     }
 
@@ -228,7 +292,7 @@ where
     }
 
     fn get_root_internal(&self) -> Result<any_pointer::Reader<'_>> {
-        let (segment_start, _seg_len) = self.arena.get_segment(0)?;
+        let segment = self.arena.get_segment(0)?;
         let pointer_reader = layout::PointerReader::get_root(
             &self.arena,
             0,
@@ -249,7 +313,7 @@ where
 
     /// Checks whether the message is [canonical](https://capnproto.org/encoding.html#canonicalization).
     pub fn is_canonical(&self) -> Result<bool> {
-        let (segment_start, seg_len) = self.arena.get_segment(0)?;
+        let segment = self.arena.get_segment(0)?;
 
         if self.arena.get_segment(1).is_ok() {
             // TODO(cleanup, apibump): should there be a nicer way to ask the arena how many
@@ -359,40 +423,58 @@ where
     }
 }
 
+pub trait WriterSegment: ReaderSegment + AsMut<[u8]> {
+    /// Writes zeroes to the provided region. Range indices are given in units of words (8 bytes).
+    fn zero_words(&mut self, range_words: std::ops::Range<u32>);
+
+    /*
+    /// Writes a single bit to this segment at the given index, provided in units of bits.
+    fn write_bit(&mut self, index: u64, value: bool);
+
+    /// Writes a byte to the this segment at the given index, provided in units of bytes.
+    fn write_u8(&mut self, index: u64, value: u8);
+
+    /// Writes a u16 to the this segment at the given index, provided in units of 2 bytes.
+    fn write_u16(&mut self, index: u64, value: u16);
+
+    /// Writes a u32 to the this segment at the given index, provided in units of 4 bytes.
+    fn write_u32(&mut self, index: u64, value: u32);
+
+    /// Writes a u64 to the this segment at the given index, provided in units of 8 bytes (words).
+    fn write_u64(&mut self, index: u64, value: u64);
+    */
+}
+
 /// An object that allocates memory for a Cap'n Proto message as it is being built.
 /// Users of capnproto-rust who wish to provide memory in non-standard ways should
-/// implement this trait. Objects implementing this trait are intended to be wrapped
-/// by `capnp::private::BuilderArena`, which handles calling the methods at the appropriate
-/// times, including calling `deallocate_segment()` on drop.
+/// implement this trait.
 ///
 /// # Safety
-/// Implementions must ensure all of the following:
+/// Implementations must ensure all of the following:
 ///   1. The memory returned by `allocate_segment` is initialized to all zeroes.
-///   2. The memory returned by `allocate_segment` is valid until `deallocate_segment()`
-///      is called on it.
+///   2. The memory returned by `allocate_segment` is valid for the lifetime of this.
 ///   3. The allocated memory does not overlap with other allocated memory.
-///   4. The allocated memory is 8-byte aligned (or the "unaligned" feature is enabled
-///      for the capnp crate).
-pub unsafe trait Allocator {
-    /// Allocates zeroed memory for a new segment, returning a pointer to the start of the segment
-    /// and a u32 indicating the length of the segment in words. The allocated segment must be
-    /// at least `minimum_size` words long (`minimum_size * 8` bytes long). Allocator implementations
-    /// commonly allocate much more than the minimum, to reduce the total number of segments needed.
-    /// A reasonable strategy is to allocate the maximum of `minimum_size` and twice the size of the
-    /// previous segment.
-    fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32);
+pub trait Allocator {
+    type AllocatedSegment: WriterSegment;
 
-    /// Indicates that a segment, previously allocated via allocate_segment(), is no longer in use.
-    /// `word_size` is the length of the segment in words, as returned from `allocate_segment()`.
-    /// `words_used` is always less than or equal to `word_size`, and indicates how many
+    /// Allocates zeroed memory for a new segment.
+    ///
+    /// The allocated segment must be at least `minimum_size` words long (`minimum_size * 8` bytes long).
+    ///
+    /// Allocator implementations commonly allocate much more than the minimum, to reduce the total
+    /// number of segments needed. A reasonable strategy is to allocate the maximum of `minimum_size`
+    /// and twice the size of the previous segment.
+    fn allocate_segment(&mut self, minimum_size: u32) -> Result<Self::AllocatedSegment>;
+
+    /// Indicates that a segment, previously allocated via [`WritingAllocator::try_allocate_segment`],
+    /// is no longer in use.
+    ///
+    /// `words_used` is always less than or equal to the word_size of the segment, and indicates how many
     /// words (contiguous from the start of the segment) were possibly written with non-zero values.
     ///
-    /// # Safety
-    /// Callers must only call this method on a pointer that has previously been been returned
-    /// from `allocate_segment()`, and only once on each such segment. `word_size` must
-    /// equal the word size returned from `allocate_segment()`, and `words_used` must be at
-    /// most `word_size`.
-    unsafe fn deallocate_segment(&mut self, ptr: *mut u8, word_size: u32, words_used: u32);
+    /// # Panics
+    /// Can and should panic if `words_used` is greater than the word_size of the allocated segment.
+    fn deallocate_segment(&mut self, segment: Self::AllocatedSegment, words_used: u32);
 }
 
 /// A container used to build a message.
@@ -461,7 +543,7 @@ where
         if self.arena.is_empty() {
             any_pointer::Reader::new(layout::PointerReader::new_default()).get_as()
         } else {
-            let (segment_start, _segment_len) = self.arena.get_segment(0)?;
+            let segment = self.arena.get_segment(0)?;
             let pointer_reader = layout::PointerReader::get_root(
                 self.arena.as_reader(),
                 0,
@@ -525,7 +607,9 @@ impl<A> ReaderSegments for Builder<A>
 where
     A: Allocator,
 {
-    fn get_segment(&self, id: u32) -> Option<&[u8]> {
+    type Segment<'a> = &'a A::AllocatedSegment where Self: 'a;
+
+    fn read_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
         self.get_segments_for_output().get(id as usize).copied()
     }
 
@@ -642,6 +726,50 @@ where
     }
 }
 
+/// A `Box<[u8]>` but which is guaranteed to be aligned to a word boundary.
+#[cfg(feature = "alloc")]
+pub struct AlignedHeapSegment {
+    inner: Box<[crate::Word]>,
+}
+
+#[cfg(feature = "alloc")]
+impl AlignedHeapSegment {
+    pub fn new(word_size: usize) -> Self {
+        Self {
+            inner: crate::Word::allocate_zeroed_vec(word_size).into_boxed_slice(),
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl AsRef<[u8]> for AlignedHeapSegment {
+    fn as_ref(&self) -> &[u8] {
+        crate::Word::words_to_bytes(&*self.inner)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl AsMut<[u8]> for AlignedHeapSegment {
+    fn as_mut(&mut self) -> &mut [u8] {
+        crate::Word::words_to_bytes_mut(&mut *self.inner)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl ReaderSegment for AlignedHeapSegment {
+    fn len_words(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl WriterSegment for AlignedHeapSegment {
+    fn zero_words(&mut self, range: std::ops::Range<u32>) {
+        self.inner[range.start as usize..range.end as usize]
+            .fill(crate::word(0, 0, 0, 0, 0, 0, 0, 0))
+    }
+}
+
 /// Standard segment allocator. Allocates each segment via `alloc::alloc::alloc_zeroed()`.
 #[derive(Debug)]
 #[cfg(feature = "alloc")]
@@ -708,15 +836,14 @@ impl HeapAllocator {
 }
 
 #[cfg(feature = "alloc")]
-unsafe impl Allocator for HeapAllocator {
-    fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32) {
+impl Allocator for HeapAllocator {
+    type AllocatedSegment = AlignedHeapSegment;
+
+    fn allocate_segment(&mut self, minimum_size: u32) -> Result<Self::AllocatedSegment> {
         let size = core::cmp::max(minimum_size, self.next_size);
-        let layout =
-            alloc::alloc::Layout::from_size_align(size as usize * BYTES_PER_WORD, 8).unwrap();
-        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            alloc::alloc::handle_alloc_error(layout);
-        }
+
+        let segment = AlignedHeapSegment::new(size as usize);
+
         match self.allocation_strategy {
             AllocationStrategy::GrowHeuristically => {
                 if size < self.max_segment_words - self.next_size {
@@ -727,17 +854,12 @@ unsafe impl Allocator for HeapAllocator {
             }
             AllocationStrategy::FixedSize => {}
         }
-        (ptr, size)
+
+        Ok(segment)
     }
 
-    unsafe fn deallocate_segment(&mut self, ptr: *mut u8, word_size: u32, _words_used: u32) {
-        unsafe {
-            alloc::alloc::dealloc(
-                ptr,
-                alloc::alloc::Layout::from_size_align(word_size as usize * BYTES_PER_WORD, 8)
-                    .unwrap(),
-            );
-        }
+    fn deallocate_segment(&mut self, segment: Self::AllocatedSegment, _words_used: u32) {
+        std::mem::drop(segment);
         self.next_size = SUGGESTED_FIRST_SEGMENT_WORDS;
     }
 }
@@ -750,20 +872,20 @@ fn test_allocate_max() {
         .max_segment_words((1 << 25) - 1)
         .first_segment_words(allocation_size);
 
-    let (a1, s1) = allocator.allocate_segment(allocation_size);
-    let (a2, s2) = allocator.allocate_segment(allocation_size);
-    let (a3, s3) = allocator.allocate_segment(allocation_size);
+    let s1 = allocator.allocate_segment(allocation_size).unwrap();
+    let s2 = allocator.allocate_segment(allocation_size).unwrap();
+    let s3 = allocator.allocate_segment(allocation_size).unwrap();
 
-    assert_eq!(s1, allocation_size);
+    assert_eq!(s1.len_words(), allocation_size);
 
     // Allocation size tops out at max_segment_words.
-    assert_eq!(s2, allocator.max_segment_words);
-    assert_eq!(s3, allocator.max_segment_words);
+    assert_eq!(s2.len_words(), allocator.max_segment_words);
+    assert_eq!(s3.len_words(), allocator.max_segment_words);
 
     unsafe {
-        allocator.deallocate_segment(a1, s1, 0);
-        allocator.deallocate_segment(a2, s2, 0);
-        allocator.deallocate_segment(a3, s3, 0);
+        allocator.deallocate_segment(s1, 0);
+        allocator.deallocate_segment(s2, 0);
+        allocator.deallocate_segment(s3, 0);
     }
 }
 
@@ -785,6 +907,70 @@ impl Default for Builder<HeapAllocator> {
     }
 }
 
+#[cfg(feature = "alloc")]
+pub enum ScratchSpaceAllocationSegment<S: WriterSegment> {
+    ScratchSpace(S),
+    Heap(AlignedHeapSegment),
+}
+
+// Implements the given methods using the same methods on two possible variants.
+#[cfg(feature = "alloc")]
+macro_rules! impl_scratch_alloc_segment {
+    // Unfortunately need different cases for `&mut self` vs `&self`.
+    ( $self:expr => $method:ident ( $($param:ident: $param_ty:ty ),* $(,)? ) ) => {
+        match $self {
+            ScratchSpaceAllocationSegment::ScratchSpace(segment) => segment.$method($( $param ),*),
+            ScratchSpaceAllocationSegment::Heap(segment) => segment.$method($( $param ),*),
+        }
+    };
+    ($(
+        fn $method:ident ( &self $(, $param:ident: $param_ty:ty )* $(,)? ) $( -> $ret_ty:ty)?;
+    )*) => {
+        $(
+            fn $method(&self, $( $param: $param_ty ),*) $(-> $ret_ty)* {
+                impl_scratch_alloc_segment!{ self => $method ( $($param: $param_ty ),* ) }
+            }
+        )*
+    };
+    ($(
+        fn $method:ident ( &mut self $(, $param:ident: $param_ty:ty )* $(,)? ) $( -> $ret_ty:ty)?;
+    )*) => {
+        $(
+            fn $method(&mut self, $( $param: $param_ty ),*) $(-> $ret_ty)* {
+                impl_scratch_alloc_segment!{ self => $method ( $($param: $param_ty ),* ) }
+            }
+        )*
+    };
+}
+
+#[cfg(feature = "alloc")]
+impl<S: WriterSegment> AsRef<[u8]> for ScratchSpaceAllocationSegment<S> {
+    impl_scratch_alloc_segment! {
+        fn as_ref(&self) -> &[u8];
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<S: WriterSegment> AsMut<[u8]> for ScratchSpaceAllocationSegment<S> {
+    impl_scratch_alloc_segment! {
+        fn as_mut(&mut self) -> &mut [u8];
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<S: WriterSegment> ReaderSegment for ScratchSpaceAllocationSegment<S> {
+    impl_scratch_alloc_segment! {
+        fn len_words(&self) -> usize;
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<S: WriterSegment> WriterSegment for ScratchSpaceAllocationSegment<S> {
+    impl_scratch_alloc_segment! {
+        fn zero_words(&mut self, range_words: std::ops::Range<u32>);
+    }
+}
+
 /// An Allocator whose first segment is a backed by a user-provided buffer.
 ///
 /// Recall that an `Allocator` implementation must ensure that allocated segments are
@@ -796,44 +982,27 @@ impl Default for Builder<HeapAllocator> {
 /// or by initially passing it to `message::Builder::new()` as a `&mut ScratchSpaceHeapAllocator`.
 /// Such reuse can save significant amounts of zeroing.
 #[cfg(feature = "alloc")]
-pub struct ScratchSpaceHeapAllocator<'a> {
-    scratch_space: &'a mut [u8],
-    scratch_space_allocated: bool,
+pub struct ScratchSpaceHeapAllocator<S: WriterSegment> {
+    scratch_space: Option<S>, // Taken on allocation, returned on deallocation.
     allocator: HeapAllocator,
 }
 
 #[cfg(feature = "alloc")]
-impl<'a> ScratchSpaceHeapAllocator<'a> {
-    /// Writes zeroes into the entire buffer and constructs a new allocator from it.
-    ///
-    /// If the buffer is large, this operation could be relatively expensive. If you want to reuse
-    /// the same scratch space in a later message, you should reuse the entire
-    /// `ScratchSpaceHeapAllocator`, to avoid paying this full cost again.
-    pub fn new(scratch_space: &'a mut [u8]) -> ScratchSpaceHeapAllocator<'a> {
-        #[cfg(not(feature = "unaligned"))]
-        {
-            if scratch_space.as_ptr() as usize % BYTES_PER_WORD != 0 {
-                panic!(
-                    "Scratch space must be 8-byte aligned, or you must enable the \"unaligned\" \
-                        feature in the capnp crate"
-                );
-            }
-        }
-
+impl<S: WriterSegment> ScratchSpaceHeapAllocator<S> {
+    /// Wraps a previously allocated segment.
+    pub fn new(mut scratch_space: S) -> Self {
         // We need to ensure that the buffer is zeroed.
-        for b in &mut scratch_space[..] {
-            *b = 0;
-        }
-        ScratchSpaceHeapAllocator {
-            scratch_space,
-            scratch_space_allocated: false,
+        scratch_space.zero_words(0..scratch_space.len_words() * WORDS_PER_POINTER);
+
+        Self {
+            scratch_space: Some(scratch_space),
             allocator: HeapAllocator::new(),
         }
     }
 
     /// Sets the size of the second segment in words, where 1 word = 8 bytes.
     /// (The first segment is the scratch space passed to `ScratchSpaceHeapAllocator::new()`.
-    pub fn second_segment_words(self, value: u32) -> ScratchSpaceHeapAllocator<'a> {
+    pub fn second_segment_words(self, value: u32) -> Self {
         ScratchSpaceHeapAllocator {
             allocator: self.allocator.first_segment_words(value),
             ..self
@@ -841,7 +1010,7 @@ impl<'a> ScratchSpaceHeapAllocator<'a> {
     }
 
     /// Sets the allocation strategy for segments after the second one.
-    pub fn allocation_strategy(self, value: AllocationStrategy) -> ScratchSpaceHeapAllocator<'a> {
+    pub fn allocation_strategy(self, value: AllocationStrategy) -> Self {
         ScratchSpaceHeapAllocator {
             allocator: self.allocator.allocation_strategy(value),
             ..self
@@ -850,37 +1019,34 @@ impl<'a> ScratchSpaceHeapAllocator<'a> {
 }
 
 #[cfg(feature = "alloc")]
-unsafe impl<'a> Allocator for ScratchSpaceHeapAllocator<'a> {
-    fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32) {
-        if (minimum_size as usize) < (self.scratch_space.len() / BYTES_PER_WORD)
-            && !self.scratch_space_allocated
-        {
-            self.scratch_space_allocated = true;
-            (
-                self.scratch_space.as_mut_ptr(),
-                (self.scratch_space.len() / BYTES_PER_WORD) as u32,
-            )
-        } else {
-            self.allocator.allocate_segment(minimum_size)
+impl<S: WriterSegment> Allocator for ScratchSpaceHeapAllocator<S> {
+    type AllocatedSegment = ScratchSpaceAllocationSegment<S>;
+
+    fn allocate_segment(&mut self, minimum_size: u32) -> Result<Self::AllocatedSegment> {
+        match self.scratch_space.take() {
+            Some(segment) if segment.len_words() >= minimum_size as usize => {
+                return Ok(ScratchSpaceAllocationSegment::ScratchSpace(segment))
+            }
+            // Else heap allocate
+            Some(segment) => {
+                // Put back - not big enough
+                self.scratch_space = Some(segment);
+            }
+            None => {}
         }
+
+        self.allocator.allocate_segment(minimum_size)
     }
 
-    unsafe fn deallocate_segment(&mut self, ptr: *mut u8, word_size: u32, words_used: u32) {
-        let seg_ptr = self.scratch_space.as_mut_ptr();
-        if ptr == seg_ptr {
-            // Rezero the slice to allow reuse of the allocator. We only need to write
-            // words that we know might contain nonzero values.
-            unsafe {
-                core::ptr::write_bytes(
-                    seg_ptr, // miri isn't happy if we use ptr instead
-                    0u8,
-                    (words_used as usize) * BYTES_PER_WORD,
-                );
+    fn deallocate_segment(&mut self, segment: Self::AllocatedSegment, words_used: u32) {
+        match segment {
+            ScratchSpaceAllocationSegment::ScratchSpace(mut scratch_space) => {
+                scratch_space.zero_words(..words_used);
+                self.scratch_space = Some(scratch_space)
             }
-            self.scratch_space_allocated = false;
-        } else {
-            self.allocator
-                .deallocate_segment(ptr, word_size, words_used);
+            ScratchSpaceAllocationSegment::Heap(segment) => {
+                self.allocator.deallocate_segment(segment, words_used)
+            }
         }
     }
 }
@@ -899,84 +1065,77 @@ unsafe impl<'a> Allocator for ScratchSpaceHeapAllocator<'a> {
 /// You can reuse a `SingleSegmentAllocator` by calling `message::Builder::into_allocator()`,
 /// or by initially passing it to `message::Builder::new()` as a `&mut SingleSegmentAllocator`.
 /// Such reuse can save significant amounts of zeroing.
-pub struct SingleSegmentAllocator<'a> {
-    segment: &'a mut [u8],
-    segment_allocated: bool,
+pub struct SingleSegmentAllocator<S: WriterSegment> {
+    segment: Option<S>, // Taken on allocation, returned on deallocation
 }
 
-impl<'a> SingleSegmentAllocator<'a> {
-    /// Writes zeroes into the entire buffer and constructs a new allocator from it.
-    ///
-    /// If the buffer is large, this operation could be relatively expensive. If you want to reuse
-    /// the same scratch space in a later message, you should reuse the entire
-    /// `SingleSegmentAllocator`, to avoid paying this full cost again.
-    pub fn new(segment: &'a mut [u8]) -> SingleSegmentAllocator<'a> {
-        #[cfg(not(feature = "unaligned"))]
-        {
-            if segment.as_ptr() as usize % BYTES_PER_WORD != 0 {
-                panic!(
-                    "Segment must be 8-byte aligned, or you must enable the \"unaligned\" \
-                        feature in the capnp crate"
-                );
-            }
-        }
-
-        // We need to ensure that the buffer is zeroed.
-        for b in &mut segment[..] {
-            *b = 0;
-        }
+impl<S: WriterSegment> SingleSegmentAllocator<S> {
+    /// Wraps a previously allocated segment.
+    pub fn new(segment: S) -> Self {
         SingleSegmentAllocator {
-            segment,
-            segment_allocated: false,
+            segment: Some(segment),
         }
     }
 }
 
-unsafe impl<'a> Allocator for SingleSegmentAllocator<'a> {
-    fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32) {
-        let available_word_count = self.segment.len() / BYTES_PER_WORD;
-        if (minimum_size as usize) > available_word_count {
-            panic!(
-                "Allocation too large: asked for {minimum_size} words, \
-                    but only {available_word_count} are available."
-            )
-        } else if self.segment_allocated {
-            panic!("Tried to allocated two segments in a SingleSegmentAllocator.")
-        } else {
-            self.segment_allocated = true;
-            (
-                self.segment.as_mut_ptr(),
-                (self.segment.len() / BYTES_PER_WORD) as u32,
-            )
-        }
-    }
+impl<S: WriterSegment> Allocator for SingleSegmentAllocator<S> {
+    type AllocatedSegment = S;
 
-    unsafe fn deallocate_segment(&mut self, ptr: *mut u8, _word_size: u32, words_used: u32) {
-        let seg_ptr = self.segment.as_mut_ptr();
-        if ptr == seg_ptr {
-            // Rezero the slice to allow reuse of the allocator. We only need to write
-            // words that we know might contain nonzero values.
-            unsafe {
-                core::ptr::write_bytes(
-                    seg_ptr, // miri isn't happy if we use ptr instead
-                    0u8,
-                    (words_used as usize) * BYTES_PER_WORD,
-                );
+    fn allocate_segment(&mut self, minimum_size: u32) -> Result<Self::AllocatedSegment> {
+        match self.segment.take() {
+            None => {
+                #[cfg(feature = "alloc")]
+                return Err(crate::Error {
+                    kind: crate::ErrorKind::BufferNotLargeEnough,
+                    extra: "Tried to allocated two segments in a SingleSegmentAllocator."
+                        .to_owned(),
+                });
+                #[cfg(not(feature = "alloc"))]
+                return Err(crate::Error::from_kind(
+                    crate::ErrorKind::BufferNotLargeEnough,
+                ));
             }
-            self.segment_allocated = false;
+            Some(segment) if segment.len_words() < minimum_size as usize => {
+                // Put back
+                self.segment = Some(segment);
+
+                #[cfg(feature = "alloc")]
+                return Err(crate::Error {
+                    kind: crate::ErrorKind::BufferNotLargeEnough,
+                    extra: format!("Allocation too large: asked for {minimum_size} words, but only {} are available.", segment.len_words())
+                });
+                #[cfg(not(feature = "alloc"))]
+                return Err(crate::Error::from_kind(
+                    crate::ErrorKind::BufferNotLargeEnough,
+                ));
+            }
+            Some(segment) => Ok(segment),
         }
+    }
+
+    fn deallocate_segment(&mut self, mut segment: Self::AllocatedSegment, words_used: u32) {
+        // Something has gone wrong if we're putting back twice.
+        debug_assert!(self.segment.is_none());
+
+        // Rezero the slice to allow reuse of the allocator. We only need to write
+        // words that we know might contain nonzero values.
+        segment.zero_words(..words_used);
+
+        self.segment = Some(segment);
     }
 }
 
-unsafe impl<'a, A> Allocator for &'a mut A
+impl<'a, A> Allocator for &'a mut A
 where
     A: Allocator,
 {
-    fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32) {
+    type AllocatedSegment = A::AllocatedSegment;
+
+    fn allocate_segment(&mut self, minimum_size: u32) -> Result<Self::AllocatedSegment> {
         (*self).allocate_segment(minimum_size)
     }
 
-    unsafe fn deallocate_segment(&mut self, ptr: *mut u8, word_size: u32, words_used: u32) {
-        (*self).deallocate_segment(ptr, word_size, words_used)
+    fn deallocate_segment(&mut self, segment: Self::AllocatedSegment, words_used: u32) {
+        (*self).deallocate_segment(segment, words_used)
     }
 }

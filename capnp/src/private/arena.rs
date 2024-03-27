@@ -19,38 +19,33 @@
 // THE SOFTWARE.
 
 use core::slice;
-use core::u64;
 
 use crate::message;
 use crate::message::Allocator;
-use crate::message::ReaderSegments;
+use crate::message::WriterSegment;
+use crate::message::{ReaderSegment, ReaderSegments};
 use crate::private::read_limiter::ReadLimiter;
 use crate::private::units::*;
 use crate::OutputSegments;
-use crate::{Error, ErrorKind, Result};
+use crate::Result;
 
 pub type SegmentId = u32;
 
-pub trait ReaderArena {
-    // return pointer to start of segment, and number of words in that segment
-    fn get_segment(&self, id: u32) -> Result<(*const u8, u32)>;
-
-    unsafe fn check_offset(
-        &self,
-        segment_id: u32,
-        start: *const u8,
-        offset_in_words: i32,
-    ) -> Result<*const u8>;
-    fn contains_interval(&self, segment_id: u32, start: *const u8, size: usize) -> Result<()>;
-    fn amplified_read(&self, virtual_amount: u64) -> Result<()>;
-
-    fn nesting_limit(&self) -> i32;
-
-    // TODO(apibump): Consider putting extract_cap(), inject_cap(), drop_cap() here
-    //   and on message::Reader. Then we could get rid of Imbue and ImbueMut, and
-    //   layout::StructReader, layout::ListReader, etc. could drop their `cap_table` fields.
+/// A wrapper around a segment, carrying a reference to a [`ReadLimiter`] to limit reads
+/// across the underlying segment collection.
+pub struct ReaderArenaSegment<'a, S> {
+    segment: S,
+    read_limiter: &'a ReadLimiter,
 }
 
+impl<'a, S: ReaderSegment> ReaderSegment for ReaderArenaSegment<'a, S> {
+    fn len_words(&self) -> usize {
+        self.segment.len_words()
+    }
+}
+
+/// A wrapper around some [`ReaderSegments`] with some additional limits to prevent denial of service.
+/// Also implements [`ReaderSegments`].
 pub struct ReaderArenaImpl<S> {
     segments: S,
     read_limiter: ReadLimiter,
@@ -83,22 +78,25 @@ where
     }
 }
 
-impl<S> ReaderArena for ReaderArenaImpl<S>
+impl<S> ReaderSegments for ReaderArenaImpl<S>
 where
     S: ReaderSegments,
 {
-    fn get_segment(&self, id: u32) -> Result<(*const u8, u32)> {
-        match self.segments.get_segment(id) {
-            Some(seg) => {
-                #[cfg(not(feature = "unaligned"))]
-                {
-                    if seg.as_ptr() as usize % BYTES_PER_WORD != 0 {
-                        return Err(Error::from_kind(ErrorKind::UnalignedSegment));
-                    }
-                }
+    type Segment<'a> = ReaderArenaSegment<'a, S>;
 
-                Ok((seg.as_ptr(), (seg.len() / BYTES_PER_WORD) as u32))
-            }
+    fn read_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
+        let segment = self.segments.read_segment(idx)?;
+
+        Some(ReaderArenaSegment {
+            segment,
+            read_limiter: &self.read_limiter,
+        })
+    }
+
+    /*
+    fn get_segment<'a>(&'a self, id: u32) -> Result<S::Segment<'a>> {
+        match self.segments.read_segment(id) {
+            Some(seg) => Ok(seg),
             None => Err(Error::from_kind(ErrorKind::InvalidSegmentId(id))),
         }
     }
@@ -147,76 +145,70 @@ where
     fn nesting_limit(&self) -> i32 {
         self.nesting_limit
     }
+    */
 }
 
-pub trait BuilderArena: ReaderArena {
+pub trait BuilderArena<S: WriterSegment>: ReaderSegments {
     fn allocate(&mut self, segment_id: u32, amount: WordCount32) -> Option<u32>;
     fn allocate_anywhere(&mut self, amount: u32) -> (SegmentId, u32);
     fn get_segment_mut(&mut self, id: u32) -> (*mut u8, u32);
-
-    fn as_reader(&self) -> &dyn ReaderArena;
 }
 
 /// A wrapper around a memory segment used in building a message.
-struct BuilderSegment {
+struct BuilderSegment<S> {
     /// Pointer to the start of the segment.
-    ptr: *mut u8,
-
-    /// Total number of words the segment could potentially use. That is, all
-    /// bytes from `ptr` to `ptr + (capacity * 8)` may be used in the segment.
-    capacity: u32,
+    ptr: S,
 
     /// Number of words already used in the segment.
     allocated: u32,
 }
 
-#[cfg(feature = "alloc")]
-type BuilderSegmentArray = alloc::vec::Vec<BuilderSegment>;
-
-#[cfg(not(feature = "alloc"))]
 #[derive(Default)]
-struct BuilderSegmentArray {
+struct BuilderSegmentArray<S> {
+    #[cfg(feature = "alloc")]
+    segments: alloc::vec::Vec<BuilderSegment<S>>,
+
     // In the no-alloc case, we only allow a single segment.
-    segment: Option<BuilderSegment>,
+    #[cfg(not(feature = "alloc"))]
+    segment: Option<BuilderSegment<S>>,
 }
 
-#[cfg(not(feature = "alloc"))]
-impl BuilderSegmentArray {
+impl<S> BuilderSegmentArray<S> {
     fn len(&self) -> usize {
-        match self.segment {
+        #[cfg(feature = "alloc")]
+        return self.segments.len();
+
+        #[cfg(not(feature = "alloc"))]
+        return match self.segment {
             Some(_) => 1,
             None => 0,
-        }
+        };
     }
 
     fn push(&mut self, segment: BuilderSegment) {
-        if self.segment.is_some() {
-            panic!("multiple segments are not supported in no-alloc mode")
-        }
-        self.segment = Some(segment);
-    }
-}
+        #[cfg(feature = "alloc")]
+        self.segments.push(segment);
 
-#[cfg(not(feature = "alloc"))]
-impl core::ops::Index<usize> for BuilderSegmentArray {
-    type Output = BuilderSegment;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        assert_eq!(index, 0);
-        match &self.segment {
-            Some(s) => s,
-            None => panic!("no segment"),
+        #[cfg(not(feature = "alloc"))]
+        {
+            if self.segment.is_some() {
+                panic!("multiple segments are not supported in no-alloc mode")
+            }
+            self.segment = Some(segment);
         }
     }
-}
 
-#[cfg(not(feature = "alloc"))]
-impl core::ops::IndexMut<usize> for BuilderSegmentArray {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        assert_eq!(index, 0);
-        match &mut self.segment {
-            Some(s) => s,
-            None => panic!("no segment"),
+    fn get(&self, index: usize) -> Option<&BuilderSegment> {
+        #[cfg(feature = "alloc")]
+        return self.segments.get(index);
+
+        #[cfg(not(feature = "alloc"))]
+        {
+            return if index == 0 {
+                self.segment.as_ref()
+            } else {
+                None
+            };
         }
     }
 }
@@ -225,8 +217,8 @@ pub struct BuilderArenaImplInner<A>
 where
     A: Allocator,
 {
-    allocator: Option<A>, // None if has already be deallocated.
-    segments: BuilderSegmentArray,
+    allocator: A,
+    segments: BuilderSegmentArray<A::AllocatedSegment>,
 }
 
 pub struct BuilderArenaImpl<A>
@@ -243,7 +235,7 @@ where
     pub fn new(allocator: A) -> Self {
         Self {
             inner: BuilderArenaImplInner {
-                allocator: Some(allocator),
+                allocator,
                 segments: Default::default(),
             },
         }
@@ -301,17 +293,30 @@ where
     /// segments.
     pub fn into_allocator(mut self) -> A {
         self.inner.deallocate_all();
-        self.inner.allocator.take().unwrap()
+        self.inner.allocator
     }
 }
 
-impl<A> ReaderArena for BuilderArenaImpl<A>
-where
-    A: Allocator,
-{
-    fn get_segment(&self, id: u32) -> Result<(*const u8, u32)> {
-        let seg = &self.inner.segments[id as usize];
-        Ok((seg.ptr, seg.allocated))
+impl<A: Allocator> ReaderSegments for BuilderArenaImpl<A> {
+    type Segment<'a> = &'a A::AllocatedSegment
+    where
+        Self: 'a;
+
+    fn read_segment<'a>(&'a self, idx: SegmentId) -> Option<Self::Segment<'a>> {
+        let segment = self.inner.segments.get(idx as usize)?;
+
+        Some(&segment.ptr)
+    }
+
+    /*
+    fn get_segment(&self, id: u32) -> Result<&[u8]> {
+        let seg = match self.inner.segments.get(id as usize) {
+            Some(seg) => seg,
+            None => return Err(Error::from_kind(ErrorKind::InvalidSegmentId(id))),
+        };
+
+        let slice = unsafe { self.inner.allocator.read(seg.ptr, seg.allocated) };
+        Ok(slice)
     }
 
     unsafe fn check_offset(
@@ -334,6 +339,7 @@ where
     fn nesting_limit(&self) -> i32 {
         0x7fffffff
     }
+    */
 }
 
 impl<A> BuilderArenaImplInner<A>
@@ -342,15 +348,9 @@ where
 {
     /// Allocates a new segment with capacity for at least `minimum_size` words.
     fn allocate_segment(&mut self, minimum_size: WordCount32) -> Result<()> {
-        let seg = match &mut self.allocator {
-            Some(a) => a.allocate_segment(minimum_size),
-            None => unreachable!(),
-        };
-        self.segments.push(BuilderSegment {
-            ptr: seg.0,
-            capacity: seg.1,
-            allocated: 0,
-        });
+        let seg = self.allocator.try_allocate_segment(minimum_size);
+        let (ptr, capacity) = seg?;
+        self.segments.push(BuilderSegment { ptr, allocated: 0 });
         Ok(())
     }
 
@@ -385,19 +385,19 @@ where
     }
 
     fn deallocate_all(&mut self) {
-        if let Some(a) = &mut self.allocator {
-            #[cfg(feature = "alloc")]
-            for seg in &self.segments {
-                unsafe {
-                    a.deallocate_segment(seg.ptr, seg.capacity, seg.allocated);
-                }
+        #[cfg(feature = "alloc")]
+        for seg in &self.segments {
+            unsafe {
+                self.allocator
+                    .deallocate_previous_segment(seg.ptr, seg.capacity, seg.allocated);
             }
+        }
 
-            #[cfg(not(feature = "alloc"))]
-            if let Some(seg) = &self.segments.segment {
-                unsafe {
-                    a.deallocate_segment(seg.ptr, seg.capacity, seg.allocated);
-                }
+        #[cfg(not(feature = "alloc"))]
+        if let Some(seg) = &self.segments.segment {
+            unsafe {
+                self.allocator
+                    .deallocate_previous_segment(seg.ptr, seg.capacity, seg.allocated);
             }
         }
     }
@@ -408,7 +408,7 @@ where
     }
 }
 
-impl<A> BuilderArena for BuilderArenaImpl<A>
+impl<A> BuilderArena<A::AllocatedSegment> for BuilderArenaImpl<A>
 where
     A: Allocator,
 {
@@ -423,10 +423,6 @@ where
     fn get_segment_mut(&mut self, id: u32) -> (*mut u8, u32) {
         self.inner.get_segment_mut(id)
     }
-
-    fn as_reader(&self) -> &dyn ReaderArena {
-        self
-    }
 }
 
 impl<A> Drop for BuilderArenaImplInner<A>
@@ -440,8 +436,17 @@ where
 
 pub struct NullArena;
 
-impl ReaderArena for NullArena {
-    fn get_segment(&self, _id: u32) -> Result<(*const u8, u32)> {
+impl ReaderSegments for NullArena {
+    type Segment<'a> = &'a [u8]
+    where
+        Self: 'a;
+
+    fn read_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
+        None
+    }
+
+    /*
+    fn get_segment(&self, _id: u32) -> Result<&[u8]> {
         Err(Error::from_kind(ErrorKind::TriedToReadFromNullArena))
     }
 
@@ -465,4 +470,5 @@ impl ReaderArena for NullArena {
     fn nesting_limit(&self) -> i32 {
         0x7fffffff
     }
+    */
 }

@@ -639,12 +639,23 @@ impl<'a> core::ops::Deref for OutputSegments<'a> {
 }
 
 impl<'s> message::ReaderSegments for OutputSegments<'s> {
-    fn get_segment(&self, id: u32) -> Option<&[u8]> {
+    type Segment<'a> = &'a [u8];
+
+    fn read_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
         match self {
             OutputSegments::SingleSegment(s) => s.get(id as usize).copied(),
 
             #[cfg(feature = "alloc")]
             OutputSegments::MultiSegment(v) => v.get(id as usize).copied(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            OutputSegments::SingleSegment(_) => 1,
+
+            #[cfg(feature = "alloc")]
+            OutputSegments::MultiSegment(ms) => ms.len(),
         }
     }
 }

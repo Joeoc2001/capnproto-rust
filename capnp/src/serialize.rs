@@ -138,7 +138,7 @@ impl<T: core::ops::Deref<Target = [u8]>> BufferSegments<T> {
 
 #[cfg(feature = "alloc")]
 impl<T: core::ops::Deref<Target = [u8]>> message::ReaderSegments for BufferSegments<T> {
-    fn get_segment(&self, id: u32) -> Option<&[u8]> {
+    fn read_segment(&self, id: u32) -> Option<&[u8]> {
         if id < self.segment_indices.len() as u32 {
             let (a, b) = self.segment_indices[id as usize];
             Some(
@@ -183,7 +183,7 @@ impl core::ops::DerefMut for OwnedSegments {
 
 #[cfg(feature = "alloc")]
 impl crate::message::ReaderSegments for OwnedSegments {
-    fn get_segment(&self, id: u32) -> Option<&[u8]> {
+    fn read_segment(&self, id: u32) -> Option<&[u8]> {
         if id < self.segment_indices.len() as u32 {
             let (a, b) = self.segment_indices[id as usize];
             Some(&self[(a * BYTES_PER_WORD)..(b * BYTES_PER_WORD)])
@@ -537,7 +537,7 @@ fn flatten_segments<R: message::ReaderSegments + ?Sized>(segments: &R) -> alloc:
         write_segment_table_internal(&mut bytes, segments).expect("Failed to write segment table.");
     }
     for i in 0..segment_count {
-        let segment = segments.get_segment(i as u32).unwrap();
+        let segment = segments.read_segment(i as u32).unwrap();
         result.extend(segment);
     }
     result
@@ -592,7 +592,7 @@ where
     // write the first Word, which contains segment_count and the 1st segment length
     buf[0..4].copy_from_slice(&(segment_count as u32 - 1).to_le_bytes());
     buf[4..8].copy_from_slice(
-        &((segments.get_segment(0).unwrap().len() / BYTES_PER_WORD) as u32).to_le_bytes(),
+        &((segments.read_segment(0).unwrap().len() / BYTES_PER_WORD) as u32).to_le_bytes(),
     );
     write.write_all(&buf)?;
 
@@ -600,7 +600,7 @@ where
         if segment_count < 4 {
             for idx in 1..segment_count {
                 buf[(idx - 1) * 4..idx * 4].copy_from_slice(
-                    &((segments.get_segment(idx as u32).unwrap().len() / BYTES_PER_WORD) as u32)
+                    &((segments.read_segment(idx as u32).unwrap().len() / BYTES_PER_WORD) as u32)
                         .to_le_bytes(),
                 );
             }
@@ -616,7 +616,7 @@ where
                 let mut buf = vec![0; (segment_count & !1) * 4];
                 for idx in 1..segment_count {
                     buf[(idx - 1) * 4..idx * 4].copy_from_slice(
-                        &((segments.get_segment(idx as u32).unwrap().len() / BYTES_PER_WORD)
+                        &((segments.read_segment(idx as u32).unwrap().len() / BYTES_PER_WORD)
                             as u32)
                             .to_le_bytes(),
                     );
@@ -645,7 +645,7 @@ where
     W: Write,
 {
     for i in 0.. {
-        if let Some(segment) = segments.get_segment(i) {
+        if let Some(segment) = segments.read_segment(i) {
             write.write_all(segment)?;
         } else {
             break;
@@ -659,7 +659,7 @@ fn compute_serialized_size<R: message::ReaderSegments + ?Sized>(segments: &R) ->
     let len = segments.len();
     let mut size = (len / 2) + 1;
     for i in 0..len {
-        let segment = segments.get_segment(i as u32).unwrap();
+        let segment = segments.read_segment(i as u32).unwrap();
         size += segment.len() / BYTES_PER_WORD;
     }
     size
@@ -986,7 +986,7 @@ pub mod test {
             let result_segments = message.into_segments();
 
             TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
-                crate::Word::words_to_bytes(&segment[..]) == result_segments.get_segment(i as u32).unwrap()
+                crate::Word::words_to_bytes(&segment[..]) == result_segments.read_segment(i as u32).unwrap()
             }))
         }
 
@@ -1003,7 +1003,7 @@ pub mod test {
             let result_segments = message.into_segments();
 
             TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
-                crate::Word::words_to_bytes(&segment[..]) == result_segments.get_segment(i as u32).unwrap()
+                crate::Word::words_to_bytes(&segment[..]) == result_segments.read_segment(i as u32).unwrap()
             }))
         }
     }
@@ -1034,7 +1034,7 @@ pub mod test {
             assert_eq!(
                 *segment,
                 result_segments
-                    .get_segment(idx as u32)
+                    .read_segment(idx as u32)
                     .expect("segment should exist")
             );
         }

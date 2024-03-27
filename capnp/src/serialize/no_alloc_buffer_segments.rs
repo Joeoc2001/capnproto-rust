@@ -157,7 +157,7 @@ impl<T: AsRef<[u8]>> NoAllocBufferSegments<T> {
 }
 
 impl<T: AsRef<[u8]>> ReaderSegments for NoAllocBufferSegments<T> {
-    fn get_segment(&self, idx: u32) -> Option<&[u8]> {
+    fn read_segment(&self, idx: u32) -> Option<&[u8]> {
         // panic safety: we are doing a lot of `unwrap` here. We assume that underlying message slice
         // holds valid capnp message - we already verified slice in read_segment_table(),
         // so these unwraps are not expected to panic unless we have bug in the code.
@@ -454,8 +454,8 @@ mod tests {
             ));
 
             assert_eq!(no_alloc_segments.len(), 1);
-            assert_eq!(no_alloc_segments.get_segment(0), Some(bytes));
-            assert_eq!(no_alloc_segments.get_segment(1), None);
+            assert_eq!(no_alloc_segments.read_segment(0), Some(bytes));
+            assert_eq!(no_alloc_segments.read_segment(1), None);
             TestResult::from_bool(true)
         }
 
@@ -477,11 +477,11 @@ mod tests {
 
             assert_eq!(no_alloc_segments.len(), segments.len());
             for (i, segment) in segments.iter().enumerate() {
-                assert_eq!(no_alloc_segments.get_segment(i as u32), Some(*segment));
+                assert_eq!(no_alloc_segments.read_segment(i as u32), Some(*segment));
             }
 
             assert_eq!(
-                no_alloc_segments.get_segment(no_alloc_segments.len() as u32),
+                no_alloc_segments.read_segment(no_alloc_segments.len() as u32),
                 None
             );
             TestResult::from_bool(true)

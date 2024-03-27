@@ -680,7 +680,7 @@ pub mod test {
 
         TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
             capnp::Word::words_to_bytes(&segment[..])
-                == message_segments.get_segment(i as u32).unwrap()
+                == message_segments.read_segment(i as u32).unwrap()
         }))
     }
 
