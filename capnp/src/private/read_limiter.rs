@@ -83,6 +83,7 @@ mod unsync {
     }
 
     impl ReadLimiter {
+        /// `limit` given in units of words (8 bytes) which can be read (fuel) before stopping decoding.
         pub fn new(limit: Option<usize>) -> Self {
             match limit {
                 Some(value) => Self {

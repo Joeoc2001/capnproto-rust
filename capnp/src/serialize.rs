@@ -37,16 +37,33 @@ pub const SEGMENTS_COUNT_LIMIT: usize = 512;
 
 /// Segments read from a single flat slice of words.
 #[cfg(feature = "alloc")]
-type SliceSegments<'a> = BufferSegments<&'a [u8]>;
+type SliceSegments<'a> = BufferSegments<&'a [crate::Word]>;
+
+/// Segments read from a single flat slice of (potentially) unaligned bytes.
+#[cfg(feature = "alloc")]
+type UnalignedSliceSegments<'a> = BufferSegments<&'a [u8]>;
+
+/// Reads a serialized message (including a segment table) from a flat slice of words, without copying.
+/// The slice is allowed to extend beyond the end of the message. On success, updates `slice` to point
+/// to the remaining words beyond the end of the message.
+///
+/// If you cannot guarantee that your slice is aligned, you should use [`read_message_from_flat_slice_unaligned`]
+/// instead.
+#[cfg(feature = "alloc")]
+pub fn read_message_from_flat_slice<'a>(
+    slice: &mut &'a [crate::Word],
+    options: message::ReaderOptions,
+) -> Result<message::Reader<BufferSegments<&'a [crate::Word]>>> {
+}
 
 /// Reads a serialized message (including a segment table) from a flat slice of bytes, without copying.
 /// The slice is allowed to extend beyond the end of the message. On success, updates `slice` to point
 /// to the remaining bytes beyond the end of the message.
 ///
-/// ALIGNMENT: If the "unaligned" feature is enabled, then there are no alignment requirements on `slice`.
-/// Otherwise, `slice` must be 8-byte aligned (attempts to read the message will trigger errors).
+/// For better performance you should prefer [`read_message_from_flat_slice`], if you can guarantee that
+/// your slice is aligned.
 #[cfg(feature = "alloc")]
-pub fn read_message_from_flat_slice<'a>(
+pub fn read_message_from_flat_slice_unaligned<'a>(
     slice: &mut &'a [u8],
     options: message::ReaderOptions,
 ) -> Result<message::Reader<BufferSegments<&'a [u8]>>> {
@@ -138,7 +155,11 @@ impl<T: core::ops::Deref<Target = [u8]>> BufferSegments<T> {
 
 #[cfg(feature = "alloc")]
 impl<T: core::ops::Deref<Target = [u8]>> message::ReaderSegments for BufferSegments<T> {
-    fn read_segment(&self, id: u32) -> Option<&[u8]> {
+    type Segment<'a> = &'a [u8]
+    where
+        Self: 'a;
+
+    fn get_segment(&self, id: u32) -> Option<&[u8]> {
         if id < self.segment_indices.len() as u32 {
             let (a, b) = self.segment_indices[id as usize];
             Some(
@@ -150,7 +171,7 @@ impl<T: core::ops::Deref<Target = [u8]>> message::ReaderSegments for BufferSegme
         }
     }
 
-    fn len(&self) -> usize {
+    fn segment_count(&self) -> usize {
         self.segment_indices.len()
     }
 }
@@ -161,7 +182,7 @@ impl<T: core::ops::Deref<Target = [u8]>> message::ReaderSegments for BufferSegme
 pub struct OwnedSegments {
     // Each pair represents a segment inside of `owned_space`.
     // (starting index (in words), ending index (in words))
-    segment_indices: alloc::vec::Vec<(usize, usize)>,
+    segment_indices: alloc::vec::Vec<core::ops::Range<usize>>,
 
     owned_space: alloc::vec::Vec<crate::Word>,
 }
@@ -183,22 +204,28 @@ impl core::ops::DerefMut for OwnedSegments {
 
 #[cfg(feature = "alloc")]
 impl crate::message::ReaderSegments for OwnedSegments {
-    fn read_segment(&self, id: u32) -> Option<&[u8]> {
+    // Since we know the underlying buffer is aligned, we can optimise reads to be aligned.
+    type Segment<'a> = &'a [crate::Word]
+    where
+        Self: 'a;
+
+    fn get_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
         if id < self.segment_indices.len() as u32 {
-            let (a, b) = self.segment_indices[id as usize];
-            Some(&self[(a * BYTES_PER_WORD)..(b * BYTES_PER_WORD)])
+            let range = self.segment_indices[id as usize];
+            let slice = &self.owned_space[range];
+            Some(slice.into())
         } else {
             None
         }
     }
 
-    fn len(&self) -> usize {
+    fn segment_count(&self) -> usize {
         self.segment_indices.len()
     }
 }
 
 #[cfg(feature = "alloc")]
-/// Helper object for constructing an `OwnedSegments` or a `SliceSegments`.
+/// Helper object for constructing an [`OwnedSegments`] or a [`SliceSegments`].
 pub struct SegmentLengthsBuilder {
     segment_indices: alloc::vec::Vec<(usize, usize)>,
     total_words: usize,
@@ -528,7 +555,7 @@ where
 #[cfg(feature = "alloc")]
 fn flatten_segments<R: message::ReaderSegments + ?Sized>(segments: &R) -> alloc::vec::Vec<u8> {
     let word_count = compute_serialized_size(segments);
-    let segment_count = segments.len();
+    let segment_count = segments.segment_count();
     let table_size = segment_count / 2 + 1;
     let mut result = alloc::vec::Vec::with_capacity(word_count);
     result.resize(table_size * BYTES_PER_WORD, 0);
@@ -537,7 +564,7 @@ fn flatten_segments<R: message::ReaderSegments + ?Sized>(segments: &R) -> alloc:
         write_segment_table_internal(&mut bytes, segments).expect("Failed to write segment table.");
     }
     for i in 0..segment_count {
-        let segment = segments.read_segment(i as u32).unwrap();
+        let segment = segments.get_segment(i as u32).unwrap();
         result.extend(segment);
     }
     result
@@ -587,12 +614,12 @@ where
     R: message::ReaderSegments + ?Sized,
 {
     let mut buf: [u8; 8] = [0; 8];
-    let segment_count = segments.len();
+    let segment_count = segments.segment_count();
 
     // write the first Word, which contains segment_count and the 1st segment length
     buf[0..4].copy_from_slice(&(segment_count as u32 - 1).to_le_bytes());
     buf[4..8].copy_from_slice(
-        &((segments.read_segment(0).unwrap().len() / BYTES_PER_WORD) as u32).to_le_bytes(),
+        &((segments.get_segment(0).unwrap().len() / BYTES_PER_WORD) as u32).to_le_bytes(),
     );
     write.write_all(&buf)?;
 
@@ -600,7 +627,7 @@ where
         if segment_count < 4 {
             for idx in 1..segment_count {
                 buf[(idx - 1) * 4..idx * 4].copy_from_slice(
-                    &((segments.read_segment(idx as u32).unwrap().len() / BYTES_PER_WORD) as u32)
+                    &((segments.get_segment(idx as u32).unwrap().len() / BYTES_PER_WORD) as u32)
                         .to_le_bytes(),
                 );
             }
@@ -616,7 +643,7 @@ where
                 let mut buf = vec![0; (segment_count & !1) * 4];
                 for idx in 1..segment_count {
                     buf[(idx - 1) * 4..idx * 4].copy_from_slice(
-                        &((segments.read_segment(idx as u32).unwrap().len() / BYTES_PER_WORD)
+                        &((segments.get_segment(idx as u32).unwrap().len() / BYTES_PER_WORD)
                             as u32)
                             .to_le_bytes(),
                     );
@@ -645,7 +672,7 @@ where
     W: Write,
 {
     for i in 0.. {
-        if let Some(segment) = segments.read_segment(i) {
+        if let Some(segment) = segments.get_segment(i) {
             write.write_all(segment)?;
         } else {
             break;
@@ -656,10 +683,10 @@ where
 
 fn compute_serialized_size<R: message::ReaderSegments + ?Sized>(segments: &R) -> usize {
     // Table size
-    let len = segments.len();
+    let len = segments.segment_count();
     let mut size = (len / 2) + 1;
     for i in 0..len {
-        let segment = segments.read_segment(i as u32).unwrap();
+        let segment = segments.get_segment(i as u32).unwrap();
         size += segment.len() / BYTES_PER_WORD;
     }
     size
@@ -986,7 +1013,7 @@ pub mod test {
             let result_segments = message.into_segments();
 
             TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
-                crate::Word::words_to_bytes(&segment[..]) == result_segments.read_segment(i as u32).unwrap()
+                crate::Word::words_to_bytes(&segment[..]) == result_segments.get_segment(i as u32).unwrap()
             }))
         }
 

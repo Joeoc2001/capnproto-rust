@@ -92,12 +92,59 @@ impl Word {
         vec![word(0, 0, 0, 0, 0, 0, 0, 0); length]
     }
 
+    /// Casts this word to a u64. On most target architectures, this will be a `nop`.
+    pub fn as_u64(self) -> u64 {
+        u64::from_ne_bytes(self.raw_content)
+    }
+
+    /// Copies a set of 8 bytes to make this.
+    pub fn from_bytes(bytes: [u8; 8]) -> Self {
+        Self { raw_content: bytes }
+    }
+
+    /// Converts a slice of words to a slice of bytes, in host endian order.
     pub fn words_to_bytes(words: &[Self]) -> &[u8] {
         unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) }
     }
 
+    /// Converts a mutable slice of words to a mutable slice of bytes, in host endian order.
     pub fn words_to_bytes_mut(words: &mut [Self]) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) }
+    }
+
+    /// Tries to convert a slice of bytes to a slice of words, in host endian order.
+    ///
+    /// Fails if the provided bytes are not aligned, or if they have a length not divisible to an integer
+    /// number of words.
+    pub fn try_bytes_to_words(bytes: &[u8]) -> Option<&[Self]> {
+        if bytes.as_ptr().align_offset(8) != 0 {
+            return None;
+        }
+        if bytes.len() % 8 != 0 {
+            return None;
+        }
+
+        let slice =
+            unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const Self, bytes.len() / 8) };
+        Some(slice)
+    }
+
+    /// Tries to convert a mutable slice of bytes to a mutable slice of words, in host endian order.
+    ///
+    /// Fails if the provided bytes are not aligned, or if they have a length not divisible to an integer
+    /// number of words.
+    pub fn try_bytes_to_words_mut(bytes: &[u8]) -> &[Self] {
+        if bytes.as_ptr().align_offset(8) != 0 {
+            return None;
+        }
+        if bytes.len() % 8 != 0 {
+            return None;
+        }
+
+        let slice = unsafe {
+            core::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *const Self, bytes.len() / 8)
+        };
+        Some(slice)
     }
 }
 
@@ -641,7 +688,7 @@ impl<'a> core::ops::Deref for OutputSegments<'a> {
 impl<'s> message::ReaderSegments for OutputSegments<'s> {
     type Segment<'a> = &'a [u8];
 
-    fn read_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
+    fn get_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
         match self {
             OutputSegments::SingleSegment(s) => s.get(id as usize).copied(),
 
@@ -650,7 +697,7 @@ impl<'s> message::ReaderSegments for OutputSegments<'s> {
         }
     }
 
-    fn len(&self) -> usize {
+    fn segment_count(&self) -> usize {
         match self {
             OutputSegments::SingleSegment(_) => 1,
 

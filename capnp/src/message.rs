@@ -141,14 +141,84 @@ impl ReaderOptions {
 
 /// A single read-only segment in a set of [`ReaderSegments`]. Guaranteed to implement
 /// `AsRef<[u8]>`, but comes with a set of optimised reading methods for performance,
-/// for example via [`AlignedSegment`].
+/// for example via `&[Word]`, which optimises reads and writes via the guaranteed alignment.
 pub trait ReaderSegment: AsRef<[u8]> {
-    fn len_words(&self) -> usize;
+    fn len_words(&self) -> u32;
+
+    /// Checks if this segment contains the given range, and if there is sufficient fuel to read it.
+    /// The range should be given in units of words (8 bytes).
+    ///
+    /// This should be performed before doing subsequent reads on this segment, as the below `read_{}`
+    /// methods may panic or fail silently on an out of bounds read.
+    #[inline]
+    fn bounds_check(&self, range: core::ops::Range<u32>) -> crate::Result<()> {
+        let end = range.start.max(range.end);
+
+        if end > self.len_words() {
+            Err(crate::Error {
+                kind: crate::ErrorKind::Failed,
+                #[cfg(feature = "alloc")]
+                extra: alloc::format!(
+                    "range {range:?} was out of bounds for slice with length {}",
+                    self.len_words()
+                ),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Gets the bit at the given index, given in units of bits.
+    fn read_bit(&self, index: u64) -> bool;
+
+    /// Gets the word at the given index, given in units of words.
+    fn read_word(&self, index: u32) -> crate::Word;
 }
 
 impl ReaderSegment for [u8] {
+    #[inline]
     fn len_words(&self) -> usize {
         self.len() / BYTES_PER_WORD
+    }
+
+    fn read_bit(&self, index: u64) -> crate::Result<bool> {
+        let byte_index = index / 8;
+        let bitmask = 1u8 << (index % 8);
+        Ok((self[byte_index as usize] & bitmask) != 0u8)
+    }
+
+    fn read_word(&self, index: u32) -> crate::Result<crate::Word> {
+        // Unaligned read means potentially many reads.
+        let root = index as usize * 8;
+        let bytes = [
+            self[root + 0],
+            self[root + 1],
+            self[root + 2],
+            self[root + 3],
+            self[root + 4],
+            self[root + 5],
+            self[root + 6],
+            self[root + 7],
+        ];
+        Ok(crate::Word::from_bytes(bytes))
+    }
+}
+
+// Optimised read operations for a byte slice which is guaranteed to be aligned to a word (8 byte) interval.
+impl<'a> ReaderSegment for [crate::Word] {
+    fn len_words(&self) -> usize {
+        self.0.len() / BYTES_PER_WORD
+    }
+
+    fn read_bit(&self, index: u64) -> crate::Result<bool> {
+        let word_index = index / 64;
+        let bitmask = 1u64 << (index % 64);
+        Ok((self.0[word_index as usize].as_u64() & bitmask) != 0u64)
+    }
+
+    #[inline]
+    fn read_word(&self, index: u32) -> crate::Result<crate::Word> {
+        Ok(self[index as usize])
     }
 }
 
@@ -156,38 +226,19 @@ impl<'a, S: ReaderSegment + ?Sized> ReaderSegment for &'a S {
     fn len_words(&self) -> usize {
         S::len_words(self)
     }
-}
 
-/// A byte slice which is guaranteed to be aligned to a word (8 byte) interval.
-#[derive(Clone, Copy)]
-pub struct AlignedReaderSegment<'a>(&'a [u8]);
-
-impl<'a> AlignedReaderSegment<'a> {
-    /// Tries to wrap a slice, returning `None` if the slice is not aligned to an 8 byte interval.
-    pub fn new(bytes: &'a [u8]) -> Option<Self> {
-        // Check alignment
-        let start_ptr = bytes.as_ptr() as usize;
-        if start_ptr % BYTES_PER_WORD != 0 {
-            return None;
-        }
-
-        Some(Self(bytes))
+    fn read_bit(&self, index: u64) -> bool {
+        S::read_bit(&self, index)
     }
-}
 
-impl<'a> AsRef<[u8]> for AlignedReaderSegment<'a> {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl<'a> ReaderSegment for AlignedReaderSegment<'a> {
-    fn len_words(&self) -> usize {
-        self.0.len() / BYTES_PER_WORD
+    fn read_word(&self, index: u32) -> crate::Word {
+        S::read_word(&self, index)
     }
 }
 
 /// An object that manages the buffers underlying a Cap'n Proto message reader.
+///
+/// The usual implementers of this trait are
 pub trait ReaderSegments {
     type Segment<'a>: ReaderSegment
     where
@@ -197,12 +248,12 @@ pub trait ReaderSegments {
     ///
     /// The returned segment is required to point to memory that remains valid until the ReaderSegments
     /// object is dropped. In safe Rust, it should not be possible to violate this requirement.
-    fn read_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>>;
+    fn get_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>>;
 
     /// Gets the number of segments.
-    fn len(&self) -> usize {
+    fn segment_count(&self) -> usize {
         for i in 0.. {
-            if self.read_segment(i as u32).is_none() {
+            if self.get_segment(i as u32).is_none() {
                 return i;
             }
         }
@@ -210,12 +261,24 @@ pub trait ReaderSegments {
     }
 
     fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.segment_count() == 0
     }
 
     // TODO(apibump): Consider putting extract_cap(), inject_cap(), drop_cap() here
     //   and on message::Reader. Then we could get rid of Imbue and ImbueMut, and
     //   layout::StructReader, layout::ListReader, etc. could drop their `cap_table` fields.
+}
+
+impl<'b, S: ReaderSegment, A: AsRef<[&'b S]>> ReaderSegments for A {
+    type Segment<'a> = &'a S where Self: 'a;
+
+    fn get_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
+        self.as_ref().get(id as usize).copied()
+    }
+
+    fn segment_count(&self) -> usize {
+        self.as_ref().len()
+    }
 }
 
 impl<'b, S> ReaderSegments for &'b S
@@ -225,51 +288,12 @@ where
     type Segment<'a> = S::Segment<'a>
         where Self: 'a;
 
-    fn read_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
-        (**self).read_segment(idx)
+    fn get_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
+        (**self).get_segment(idx)
     }
 
-    fn len(&self) -> usize {
-        (**self).len()
-    }
-}
-
-/// An array of segments, aligned to an 8-byte interval.
-///
-/// If you don't know that your segments are aligned to an 8-byte interval,
-/// use a slice of slices (`&[&[u8]]`) instead. Note that this incurs a performance
-/// penalty.
-pub struct SegmentArray<'a> {
-    segments: &'a [AlignedReaderSegment<'a>],
-}
-
-impl<'a> SegmentArray<'a> {
-    pub fn new(segments: &'a [AlignedReaderSegment<'a>]) -> SegmentArray<'a> {
-        SegmentArray { segments }
-    }
-}
-
-impl<'b> ReaderSegments for SegmentArray<'b> {
-    type Segment<'a> = AlignedReaderSegment<'a> where Self: 'a;
-
-    fn read_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
-        self.segments.get(id as usize).copied()
-    }
-
-    fn len(&self) -> usize {
-        self.segments.len()
-    }
-}
-
-impl<'b> ReaderSegments for [&'b [u8]] {
-    type Segment<'a> = &'a [u8] where Self: 'a;
-
-    fn read_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
-        self.get(id as usize).copied()
-    }
-
-    fn len(&self) -> usize {
-        self.len()
+    fn segment_count(&self) -> usize {
+        (**self).segment_count()
     }
 }
 
@@ -347,7 +371,7 @@ where
         let mut message = Builder::new(HeapAllocator::new().first_segment_words(size as u32));
         message.set_root_canonical(root)?;
         let output_segments = message.get_segments_for_output();
-        assert_eq!(1, output_segments.len());
+        assert_eq!(1, output_segments.segment_count());
         let output = output_segments[0];
         assert!((output.len() / BYTES_PER_WORD) as u64 <= size);
         let mut result = crate::Word::allocate_zeroed_vec(output.len() / BYTES_PER_WORD);
@@ -425,7 +449,7 @@ where
 
 pub trait WriterSegment: ReaderSegment + AsMut<[u8]> {
     /// Writes zeroes to the provided region. Range indices are given in units of words (8 bytes).
-    fn zero_words(&mut self, range_words: std::ops::Range<u32>);
+    fn zero_words(&mut self, range_words: core::ops::Range<u32>);
 
     /*
     /// Writes a single bit to this segment at the given index, provided in units of bits.
@@ -574,7 +598,7 @@ where
         let (seg_start, _seg_len) = self.arena.get_segment_mut(0);
         let pointer = layout::PointerBuilder::get_root(&mut self.arena, 0, seg_start);
         SetterInput::set_pointer_builder(pointer, value, true)?;
-        assert_eq!(self.get_segments_for_output().len(), 1);
+        assert_eq!(self.get_segments_for_output().segment_count(), 1);
         Ok(())
     }
 
@@ -609,12 +633,12 @@ where
 {
     type Segment<'a> = &'a A::AllocatedSegment where Self: 'a;
 
-    fn read_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
+    fn get_segment<'a>(&'a self, id: u32) -> Option<Self::Segment<'a>> {
         self.get_segments_for_output().get(id as usize).copied()
     }
 
-    fn len(&self) -> usize {
-        self.get_segments_for_output().len()
+    fn segment_count(&self) -> usize {
+        self.get_segments_for_output().segment_count()
     }
 }
 
@@ -742,29 +766,22 @@ impl AlignedHeapSegment {
 }
 
 #[cfg(feature = "alloc")]
-impl AsRef<[u8]> for AlignedHeapSegment {
-    fn as_ref(&self) -> &[u8] {
-        crate::Word::words_to_bytes(&*self.inner)
+impl AsRef<[crate::Word]> for AlignedHeapSegment {
+    fn as_ref(&self) -> &[crate::Word] {
+        &*self.inner
     }
 }
 
 #[cfg(feature = "alloc")]
-impl AsMut<[u8]> for AlignedHeapSegment {
-    fn as_mut(&mut self) -> &mut [u8] {
-        crate::Word::words_to_bytes_mut(&mut *self.inner)
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl ReaderSegment for AlignedHeapSegment {
-    fn len_words(&self) -> usize {
-        self.inner.len()
+impl AsMut<[crate::Word]> for AlignedHeapSegment {
+    fn as_mut(&mut self) -> &mut [crate::Word] {
+        &mut *self.inner
     }
 }
 
 #[cfg(feature = "alloc")]
 impl WriterSegment for AlignedHeapSegment {
-    fn zero_words(&mut self, range: std::ops::Range<u32>) {
+    fn zero_words(&mut self, range: core::ops::Range<u32>) {
         self.inner[range.start as usize..range.end as usize]
             .fill(crate::word(0, 0, 0, 0, 0, 0, 0, 0))
     }
@@ -859,7 +876,7 @@ impl Allocator for HeapAllocator {
     }
 
     fn deallocate_segment(&mut self, segment: Self::AllocatedSegment, _words_used: u32) {
-        std::mem::drop(segment);
+        core::mem::drop(segment);
         self.next_size = SUGGESTED_FIRST_SEGMENT_WORDS;
     }
 }
@@ -961,13 +978,17 @@ impl<S: WriterSegment> AsMut<[u8]> for ScratchSpaceAllocationSegment<S> {
 impl<S: WriterSegment> ReaderSegment for ScratchSpaceAllocationSegment<S> {
     impl_scratch_alloc_segment! {
         fn len_words(&self) -> usize;
+        fn bounds_check(&self, range: core::ops::Range<usize>) -> crate::Result<()>;
+
+        fn read_bit(&self, index: u64) -> bool;
+        fn read_word(&self, index: u32) -> crate::Word;
     }
 }
 
 #[cfg(feature = "alloc")]
 impl<S: WriterSegment> WriterSegment for ScratchSpaceAllocationSegment<S> {
     impl_scratch_alloc_segment! {
-        fn zero_words(&mut self, range_words: std::ops::Range<u32>);
+        fn zero_words(&mut self, range_words: core::ops::Range<u32>);
     }
 }
 

@@ -572,7 +572,7 @@ mod tests {
             let result_segments = message.into_segments();
 
             TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
-                crate::Word::words_to_bytes(&segment[..]) == result_segments.read_segment(i as u32).unwrap()
+                crate::Word::words_to_bytes(&segment[..]) == result_segments.get_segment(i as u32).unwrap()
             }))
         }
 

@@ -24,7 +24,8 @@ use core::mem;
 use core::ptr;
 
 use crate::data;
-use crate::private::arena::{BuilderArena, NullArena, ReaderArena, SegmentId};
+use crate::message::ReaderSegment;
+use crate::private::arena::{BuilderArena, NullArena, SegmentId};
 #[cfg(feature = "alloc")]
 use crate::private::capability::ClientHook;
 use crate::private::mask::Mask;
@@ -140,7 +141,18 @@ fn wire_pointer_align() {
     assert_eq!(core::mem::align_of::<WirePointer>(), 1);
 }
 
+impl From<crate::Word> for WirePointer {
+    fn from(word: crate::Word) -> Self {
+        unsafe { core::mem::transmute(word) } // Both POD
+    }
+}
+
 impl WirePointer {
+    #[inline]
+    fn read_at(segment: &impl ReaderSegment, offset: u32) -> Self {
+        segment.read_word(offset).into()
+    }
+
     #[inline]
     pub fn kind(&self) -> WirePointerKind {
         WirePointerKind::from(self.offset_and_kind.get() as u8 & 3)
@@ -156,6 +168,7 @@ impl WirePointer {
         self.offset_and_kind.get() == WirePointerKind::Other as u32
     }
 
+    /*
     #[inline]
     pub unsafe fn target(ptr: *const Self) -> *const u8 {
         let this_addr: *const u8 = ptr as *const _;
@@ -189,6 +202,8 @@ impl WirePointer {
             )
         }
     }
+
+    */
 
     #[inline]
     pub fn set_kind_and_target(&mut self, kind: WirePointerKind, target: *mut u8) {
@@ -346,6 +361,7 @@ mod wire_helpers {
     use core::{ptr, slice};
 
     use crate::data;
+    use crate::message::{ReaderSegment, ReaderSegments};
     use crate::private::arena::*;
     #[cfg(feature = "alloc")]
     use crate::private::capability::ClientHook;
@@ -388,37 +404,41 @@ mod wire_helpers {
         ((bits + 7) / (BITS_PER_BYTE as u64)) as ByteCount32
     }
 
+    // Done inline on reads from [`ReaderSegments`].
+    /*
     #[inline]
     pub fn bounds_check(
-        arena: &dyn ReaderArena,
+        arena: &impl ReaderSegments,
         segment_id: u32,
-        start: *const u8,
-        size_in_words: usize,
+        range_words: std::ops::Range<usize>,
         _kind: WirePointerKind,
     ) -> Result<()> {
-        arena.contains_interval(segment_id, start, size_in_words)
+
     }
 
     #[inline]
     pub fn amplified_read(arena: &dyn ReaderArena, virtual_amount: u64) -> Result<()> {
         arena.amplified_read(virtual_amount)
     }
+    */
 
+    /// Allocates a block of memory. Tries to allocate in the provided segment ID, but falls
+    /// back on other existing segments or allocating a completely fresh segment if required.
     #[inline]
-    pub unsafe fn allocate(
-        arena: &mut dyn BuilderArena,
-        reff: *mut WirePointer,
-        segment_id: u32,
+    pub fn allocate(
+        arena: &mut impl BuilderArena,
+        reff: &mut WirePointer,
+        segment_id: SegmentId,
         amount: WordCount32,
         kind: WirePointerKind,
     ) -> (*mut u8, *mut WirePointer, u32) {
-        let is_null = (*reff).is_null();
+        let is_null = reff.is_null();
         if !is_null {
             zero_object(arena, segment_id, reff)
         }
 
         if amount == 0 && kind == WirePointerKind::Struct {
-            (*reff).set_kind_and_target_for_empty_struct();
+            reff.set_kind_and_target_for_empty_struct();
             return (reff as *mut _, reff, segment_id);
         }
 
@@ -495,28 +515,28 @@ mod wire_helpers {
     }
 
     /// Follows a WirePointer to get a triple containing:
-    ///   - the pointed-to object
+    ///   - the offset of the pointed-to object, in words.
     ///   - the resolved WirePointer, whose kind is something other than WirePointerKind::Far
     ///   - the segment on which the pointed-to object lives
     #[inline]
-    pub unsafe fn follow_fars(
-        arena: &dyn ReaderArena,
-        reff: *const WirePointer,
+    pub fn follow_fars(
+        arena: &impl ReaderSegments,
+        reff: WirePointer,
         segment_id: u32,
-    ) -> Result<(*const u8, *const WirePointer, u32)> {
-        if (*reff).kind() == WirePointerKind::Far {
-            let far_segment_id = (*reff).far_segment_id();
+    ) -> Result<(WordCount32, WirePointer, u32)> {
+        if reff.kind() == WirePointerKind::Far {
+            let far_segment_id = reff.far_segment_id();
 
-            let (seg_start, _seg_len) = arena.get_segment(far_segment_id)?;
-            let ptr = seg_start
-                .offset((*reff).far_position_in_segment() as isize * BYTES_PER_WORD as isize);
+            let seg = arena.get_segment(far_segment_id)?;
+            let offset = reff.far_position_in_segment();
 
-            let pad_words: usize = if (*reff).is_double_far() { 2 } else { 1 };
-            bounds_check(arena, far_segment_id, ptr, pad_words, WirePointerKind::Far)?;
+            // Check pointed to memory is readable
+            let pad_words: u32 = if (*reff).is_double_far() { 2 } else { 1 };
+            seg.bounds_check(offset..(offset + pad_words))?;
 
-            let pad: *const WirePointer = ptr as *const _;
+            let pad = WirePointer::read_at(arena, offset);
 
-            if !(*reff).is_double_far() {
+            if !reff.is_double_far() {
                 Ok((
                     WirePointer::target_from_segment(pad, arena, far_segment_id)?,
                     pad,
@@ -525,13 +545,12 @@ mod wire_helpers {
             } else {
                 // Landing pad is another far pointer. It is followed by a tag describing the
                 // pointed-to object.
+                let tag = WirePointer::read_at(arena, offset + 1);
 
-                let tag = pad.offset(1);
-                let double_far_segment_id = (*pad).far_segment_id();
+                let double_far_segment_id = pad.far_segment_id();
                 let (segment_start, _segment_len) = arena.get_segment(double_far_segment_id)?;
-                let ptr = segment_start
-                    .offset((*pad).far_position_in_segment() as isize * BYTES_PER_WORD as isize);
-                Ok((ptr, tag, double_far_segment_id))
+                let offset = pad.far_position_in_segment();
+                Ok((offset, tag, double_far_segment_id))
             }
         } else {
             Ok((

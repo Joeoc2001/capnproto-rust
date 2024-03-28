@@ -42,6 +42,23 @@ impl<'a, S: ReaderSegment> ReaderSegment for ReaderArenaSegment<'a, S> {
     fn len_words(&self) -> usize {
         self.segment.len_words()
     }
+
+    fn bounds_check(&self, range: core::ops::Range<u32>) -> crate::Result<()> {
+        self.read_limiter
+            .can_read(range.end.saturating_sub(range.start))?;
+
+        S::bounds_check(&self, range)
+    }
+
+    // For reads, tick on the read limiter before actually reading.
+    fn read_bit(&self, index: u64) -> bool {
+        S::read_bit(&self, index)
+    }
+
+    fn read_word(&self, index: u32) -> crate::Word {
+        self.read_limiter.can_read(1)?;
+        S::read_bit(&self, index)
+    }
 }
 
 /// A wrapper around some [`ReaderSegments`] with some additional limits to prevent denial of service.
@@ -84,8 +101,8 @@ where
 {
     type Segment<'a> = ReaderArenaSegment<'a, S>;
 
-    fn read_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
-        let segment = self.segments.read_segment(idx)?;
+    fn get_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
+        let segment = self.segments.get_segment(idx)?;
 
         Some(ReaderArenaSegment {
             segment,
@@ -302,7 +319,7 @@ impl<A: Allocator> ReaderSegments for BuilderArenaImpl<A> {
     where
         Self: 'a;
 
-    fn read_segment<'a>(&'a self, idx: SegmentId) -> Option<Self::Segment<'a>> {
+    fn get_segment<'a>(&'a self, idx: SegmentId) -> Option<Self::Segment<'a>> {
         let segment = self.inner.segments.get(idx as usize)?;
 
         Some(&segment.ptr)
@@ -441,7 +458,7 @@ impl ReaderSegments for NullArena {
     where
         Self: 'a;
 
-    fn read_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
+    fn get_segment<'a>(&'a self, idx: u32) -> Option<Self::Segment<'a>> {
         None
     }
 
